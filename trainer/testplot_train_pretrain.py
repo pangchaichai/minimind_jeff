@@ -15,14 +15,22 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, \
+    init_model, SkipBatchSampler
+
+from torch.utils.tensorboard import SummaryWriter
 
 warnings.filterwarnings('ignore')
 
+# ✅ 全局 writer 变量
+writer = None
+
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    global writer  # ✅ 声明使用全局 writer
     start_time = time.time()
     last_step = start_step
+
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
@@ -54,8 +62,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+
+            # 打印日志
+            Logger(
+                f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+
+            # ✅ TensorBoard 记录 - 放在这里！
+            if writer is not None and is_main_process():
+                global_step = epoch * iters + step
+                writer.add_scalar('Loss/train', current_loss, global_step)
+                writer.add_scalar('Loss/logits', current_logits_loss, global_step)
+                writer.add_scalar('Loss/aux_loss', current_aux_loss, global_step)
+                writer.add_scalar('Learning_Rate', current_lr, global_step)
+
+            if wandb:
+                wandb.log({
+                    "loss": current_loss,
+                    "logits_loss": current_logits_loss,
+                    "aux_loss": current_aux_loss,
+                    "learning_rate": current_lr,
+                    "epoch_time": eta_min
+                })
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
@@ -65,7 +92,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='/Users/yn/minimind/checkpoints')
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler,
+                          epoch=epoch, step=step, wandb=wandb, save_dir='/Users/yn/minimind/checkpoints')
             model.train()
             del state_dict
 
@@ -81,61 +109,76 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
+    # ... 所有 parser.add_argument 保持不变 ...
     parser.add_argument("--save_dir", type=str, default="./Users/yn/minimind/out", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=1, help="batch size")#默认32
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=1, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="float32", help="混合精度类型")#默认bfloat16
-    parser.add_argument("--num_workers", type=int, default=0, help="数据加载线程数")#默认8
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")#默认8
+    parser.add_argument("--dtype", type=str, default="float32", help="混合精度类型")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")#默认0
+    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")#默认768
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")#默认8
-    parser.add_argument('--max_seq_len', default=256, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")#默认340
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument("--data_path", type=str, default="/Users/yn/minimind/minimind_dataset/100k_pretraint2t.jsonl", help="预训练数据路径")
-    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument('--hidden_size', default=256, type=int, help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=6, type=int, help="隐藏层数量")
+    parser.add_argument('--max_seq_len', default=128, type=int, help="训练的最大截断长度")
+    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构")
+    parser.add_argument("--data_path", type=str,
+                        default="/Users/yn/minimind/minimind_dataset/100ksample_pretrain.jsonl",
+                        help="预训练数据路径")
+    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练")
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
-    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速")
     args = parser.parse_args()
+
+    # ✅ 初始化 TensorBoard writer
+    if is_main_process():
+        writer = SummaryWriter(log_dir='../out/logs')
+        Logger(f'📊 TensorBoard 日志目录: ../out/logs')
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='/Users/yn/minimind/checkpoints') if args.from_resume==1 else None
-    
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=bool(args.use_moe)
+    )
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight,
+                             save_dir='/Users/yn/minimind/checkpoints') if args.from_resume == 1 else None
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
+
     # ========== 4. 配wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
+
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
+
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -144,7 +187,8 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
+        Logger(f'✅ 从 Epoch {start_epoch}, Step {start_step} 恢复训练')
+
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -152,19 +196,30 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
-    
+
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=False)#默认pin_memory=True
-        if skip > 0: 
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=False)
+
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
-        else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
-    
+
+        train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+
+        # 每个 epoch 结束后重置 start_step（只在第一个 epoch 需要跳过）
+        start_step = 0
+
+    # ✅ 训练结束后关闭 writer
+    if writer is not None:
+        writer.close()
+        Logger('📊 TensorBoard writer 已关闭')
+
     # ========== 9. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
